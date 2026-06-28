@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { rankCandidates, type CandidateForRanking } from './ranking';
+import { rankCandidates, type CandidateForRanking } from './ranking-new';
 import { buildJobRequirements } from './jd-digest';
 import type { CrustdataProfileResponse } from './crustdata-client';
 
@@ -40,6 +40,10 @@ async function run() {
         id: c.signal_candidate_id,
         headlineHint: null,
         locationHint: null,
+        searchTitle: null,
+        searchSnippet: null,
+        enrichmentStatus: 'completed',
+        lastEnrichedAt: null,
         crustdata: crustdata as CrustdataProfileResponse,
       };
     });

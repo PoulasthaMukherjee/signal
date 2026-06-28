@@ -4,12 +4,12 @@ import { redis } from '@/lib/redis/client';
 import { toJsonValue } from '@/lib/prisma/json';
 import { createLogger } from '@/lib/logger';
 import { buildJobRequirements, type SourcingJobContextInput } from './jd-digest';
-import { rankCandidates } from './ranking';
+import { rankCandidates } from './ranking-new';
 import { discoverCandidates, type DiscoveredCandidate, type DiscoveryTelemetry } from './discovery';
 import { getLocationBoostWeight, getSourcingConfig } from './config';
-import { isMeaningfulLocation, isNoisyLocationHint, canonicalizeLocation, extractPrimaryCity, compareFitWithConfidence, STRONG_LOCATION_TYPES } from './ranking';
+import { isMeaningfulLocation, isNoisyLocationHint, canonicalizeLocation, extractPrimaryCity, compareFitWithConfidence, STRONG_LOCATION_TYPES } from './ranking-new';
 import { getRecentlyExposedCandidateIds } from './novelty';
-import type { CandidateForRanking, FitBreakdown, MatchTier, LocationMatchType, ScoredCandidate } from './ranking';
+import type { CandidateForRanking, FitBreakdown, MatchTier, LocationMatchType, ScoredCandidate } from './ranking-new';
 import type { TrackDecision } from './types';
 import { jobTrackToDbFilter } from './types';
 import { guardedTopKSwap } from './top20-guards';
@@ -341,8 +341,43 @@ export async function runSourcingOrchestrator(
 
   // 2. Rank pool candidates
   const poolForRanking: CandidateForRanking[] = poolRows.map((r) => toRankingCandidate(r));
-  const hasLocationConstraint = Boolean(requirements.location?.trim());
   const poolForRankingById = new Map(poolForRanking.map((r) => [r.id, r]));
+
+  // 2.5 ActiveGraph Home Pool Search
+  const { generateTagsFromJD, searchHomePool } = await import('./activegraph-client');
+  const homeTags = generateTagsFromJD(requirements);
+  let homeCandidates: any[] = [];
+  try {
+    // Search ActiveGraph for candidates matching the JD tags
+    homeCandidates = await searchHomePool(homeTags, tenantId, 300);
+    log.info({ requestId, tags: homeTags, found: homeCandidates.length }, 'ActiveGraph home pool searched');
+  } catch (err) {
+    log.error({ err }, 'Failed to search ActiveGraph home pool');
+  }
+
+  // Merge ActiveGraph candidates into the pool for ranking if they aren't already there
+  let addedFromHome = 0;
+  for (const hc of homeCandidates) {
+    if (!poolForRankingById.has(hc.signal_candidate_id)) {
+      const mappedCandidate: CandidateForRanking = {
+        id: hc.signal_candidate_id,
+        headlineHint: hc.profile?.basic_profile?.headline ?? null,
+        locationHint: hc.profile?.basic_profile?.location?.full_location ?? null,
+        searchTitle: null,
+        searchSnippet: null,
+        enrichmentStatus: 'completed',
+        lastEnrichedAt: new Date(),
+        crustdata: hc.profile, // Map the full Crustdata blob for the ranker
+        snapshot: null,
+      };
+      poolForRanking.push(mappedCandidate);
+      poolForRankingById.set(mappedCandidate.id, mappedCandidate);
+      addedFromHome++;
+    }
+  }
+  log.info({ requestId, addedFromHome, totalPool: poolForRanking.length }, 'Merged ActiveGraph candidates into ranking pool');
+
+  const hasLocationConstraint = Boolean(requirements.location?.trim());
   const requestedCountryCode = config.countryGuardEnabled && hasLocationConstraint
     ? deriveCountryCodeFromLocationText(requirements.location)
     : null;
@@ -485,10 +520,7 @@ export async function runSourcingOrchestrator(
 
   const scoredPoolRaw = rankCandidates(poolForRanking, requirements, {
     fitScoreEpsilon: config.fitScoreEpsilon,
-    locationBoostWeight: getLocationBoostWeight(config, trackDecision?.track),
     track: trackDecision?.track,
-    preResolvedRoles: poolPreResolvedRoles,
-    preResolvedLocations: poolPreResolvedLocations,
   });
   const countryGuardFilteredCandidateIds = new Set<string>();
   let countryGuardSerpLocaleSkippedCount = 0;
@@ -903,11 +935,16 @@ export async function runSourcingOrchestrator(
             }).filter((p: any) => p.linkedinUrl);
 
 
+            // Combine ActiveGraph/Pool candidates with fresh Crustdata candidates
+            // Filter out pool candidates that we just fetched from Crustdata to avoid duplicates
+            const fetchedCrustdataIds = new Set(mappedForRanking.map(c => c.id));
+            const activeGraphAndPool = poolForRanking.filter(c => !fetchedCrustdataIds.has(c.id));
+            const combinedForRanking = [...activeGraphAndPool, ...mappedForRanking];
+
             // Local ranking against full JD
             const locationBoostWeight = getLocationBoostWeight(config, trackDecision?.track);
-            const scored = rankCandidates(mappedForRanking, requirements, {
+            const scored = rankCandidates(combinedForRanking, requirements, {
               fitScoreEpsilon: config.fitScoreEpsilon,
-              locationBoostWeight,
               track: trackDecision?.track,
             });
 
@@ -921,9 +958,22 @@ export async function runSourcingOrchestrator(
             // first and only write the 100 we actually serve (7 batches ≈ 14s).
             const profileByUrl = new Map(mappedForRanking.map((p) => [p.id, p]));
 
+            // ── Ingest all Crustdata profiles to ActiveGraph (Background) ──────────
+            const { ingestCandidate, generateTagsFromCandidate } = await import('./activegraph-client');
+            Promise.all(mappedForRanking.map(async (candidate) => {
+              const tags = generateTagsFromCandidate(candidate);
+              return ingestCandidate(tenantId, candidate, tags, requestId);
+            })).then(results => {
+              const successCount = results.filter(Boolean).length;
+              console.log(`📡 [ORCHESTRATOR] INGESTED ${successCount}/${mappedForRanking.length} TO ACTIVEGRAPH (Async)`);
+            }).catch(err => {
+              console.error(`[activegraph-client] Batch ingest failed:`, err);
+            });
+
             // Build top-100 profiles for DB write (ranked order already in `scored`)
             const top100Profiles = scored.slice(0, 100).map((sc) => {
-              const p = profileByUrl.get(sc.candidateId)!;
+              const p = profileByUrl.get(sc.candidateId);
+              if (!p) return null; // Was from pool/ActiveGraph, already in DB
               return {
                 title: p.searchTitle || '',
                 snippet: p.searchSnippet || '',
@@ -936,7 +986,7 @@ export async function runSourcingOrchestrator(
                 profilePictureUrl: (p as any).profilePictureUrl ?? undefined,
                 crustdata: (p as any).crustdata,
               };
-            }).filter((p) => !!p.linkedinId);
+            }).filter((p): p is NonNullable<typeof p> => p !== null && !!p.linkedinId);
 
             const { upsertDiscoveredCandidates } = await import('./upsert-candidates');
             const candidateMap = await upsertDiscoveredCandidates(tenantId, top100Profiles, 'crustdata_query', 'crustdata');
@@ -944,15 +994,19 @@ export async function runSourcingOrchestrator(
             console.log(`💾 [ORCHESTRATOR] UPSERTED ${candidateMap.size} CANDIDATES TO DB`);
 
             const allRankedWithIds = scored.slice(0, 100).map((sc) => {
-              const profile = profileByUrl.get(sc.candidateId)!;
-              const linkedinId = extractLinkedInIdFromUrl(profile.linkedinUrl);
-              const dbId = linkedinId ? candidateMap.get(linkedinId) : undefined;
+              const profile = profileByUrl.get(sc.candidateId);
+              const poolCandidate = poolForRankingById.get(sc.candidateId);
+              
+              const linkedinUrl = profile?.linkedinUrl || poolCandidate?.id || '';
+              const linkedinId = extractLinkedInIdFromUrl(linkedinUrl);
+              const dbId = profile && linkedinId ? candidateMap.get(linkedinId) : poolCandidate?.id;
+
               return {
                 candidateId: dbId || '',
-                linkedinUrl: profile.linkedinUrl,
-                name: profile.name,
-                headlineHint: profile.headlineHint,
-                locationHint: profile.locationHint,
+                linkedinUrl: linkedinUrl,
+                name: profile?.name || '',
+                headlineHint: profile?.headlineHint || poolCandidate?.headlineHint || '',
+                locationHint: profile?.locationHint || poolCandidate?.locationHint || '',
                 fitScore: sc.fitScore,
                 matchTier: sc.matchTier,
                 locationMatchType: sc.locationMatchType,
@@ -1265,10 +1319,7 @@ export async function runSourcingOrchestrator(
 
           const scoredDiscovered = rankCandidates(discoveredForRanking, requirements, {
             fitScoreEpsilon: config.fitScoreEpsilon,
-            locationBoostWeight: getLocationBoostWeight(config, trackDecision?.track),
             track: trackDecision?.track,
-            preResolvedRoles: discoveredPreResolvedRoles,
-            preResolvedLocations: discoveredPreResolvedLocations,
           });
 
           // Penalize discovered unknown_location candidates that don't clear quality thresholds
